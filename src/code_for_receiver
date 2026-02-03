@@ -1,0 +1,361 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// ---------- CONFIG ----------
+const char* wifi_ssid = "";
+const char* wifi_password = "";
+
+const char* ap_ssid = "SAFE~STEPS";
+const char* ap_password = "12345678";
+
+const String phoneNumber = "";
+const String twilioAccountSid = "";
+const String twilioAuthToken = "";
+const String twilioPhoneNumber = "";
+
+// Hardware pins
+const int servoPin = 18;
+const int forwardPin = 19;  // D19 - digital input
+const int backwardPin = 21; // D21 - digital input
+
+// Servo positions
+Servo myServo;
+const int servoCenter = 90;
+const int servoLeft = 45;
+const int servoRight = 135;
+
+// Detection settings
+const unsigned long debounceDelay = 100;
+const unsigned long detectionCooldown = 3000;
+const unsigned long resetDelay = 8000;
+
+// State variables
+WebServer server(80);
+String lastMessage = "System Ready";
+String signalStatus = "Standby";
+bool sosDetected = false;
+bool systemReady = false;
+
+// Signal state
+bool forwardSignal = false;
+bool backwardSignal = false;
+unsigned long lastDetectionTime = 0;
+unsigned long lastForwardChange = 0;
+unsigned long lastBackwardChange = 0;
+bool lastForwardState = false;
+bool lastBackwardState = false;
+
+WiFiClientSecure secureClient;
+
+// ----------------- Helper Functions -----------------
+String urlEncode(const String& str) {
+  String encoded = "";
+  for (unsigned int i = 0; i < str.length(); i++) {
+    char c = str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      encoded += c;
+    } else {
+      encoded += "%" + String(c, HEX);
+    }
+  }
+  return encoded;
+}
+
+void moveServo(int targetPos) {
+  int currentPos = myServo.read();
+  int step = (targetPos > currentPos) ? 3 : -3;
+  
+  while (abs(currentPos - targetPos) > 2) {
+    currentPos += step;
+    if ((step > 0 && currentPos > targetPos) || (step < 0 && currentPos < targetPos)) {
+      currentPos = targetPos;
+    }
+    myServo.write(currentPos);
+    delay(20);
+  }
+  myServo.write(targetPos);
+}
+
+// ----------------- Twilio Emergency Call -----------------
+void triggerEmergencyCall(const String& message) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - cannot make emergency call");
+    return;
+  }
+
+  Serial.println("🚨 EMERGENCY CALL TRIGGERED: " + message);
+  
+  String twiml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say voice=\"alice\" language=\"en-IN\">Emergency Alert! " + message + ". Location assistance may be needed. This is an automated SOS call.</Say></Response>";
+  String url = "https://api.twilio.com/2010-04-01/Accounts/" + twilioAccountSid + "/Calls.json";
+
+  HTTPClient http;
+  secureClient.setInsecure();
+  
+  if (http.begin(secureClient, url)) {
+    http.setAuthorization(twilioAccountSid.c_str(), twilioAuthToken.c_str());
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    String postData = "To=" + urlEncode(phoneNumber) +
+                      "&From=" + urlEncode(twilioPhoneNumber) +
+                      "&Twiml=" + urlEncode(twiml);
+
+    int httpCode = http.POST(postData);
+    
+    if (httpCode == 201) {
+      Serial.println("✅ Emergency call sent successfully!");
+    } else {
+      Serial.printf("⚠ Call failed with code: %d\n", httpCode);
+      Serial.println("Response: " + http.getString());
+    }
+    http.end();
+  }
+}
+
+// ----------------- Signal Processing -----------------
+void processEmergencySignal(bool forward, bool backward) {
+  sosDetected = true;
+  lastDetectionTime = millis();
+  signalStatus = "🚨 EMERGENCY DETECTED!";
+  
+  String alertMessage = "";
+  
+  if (forward && backward) {
+    moveServo(servoCenter);
+    alertMessage = "Multiple direction emergency signal detected";
+    Serial.println("🔄 DUAL SIGNAL EMERGENCY");
+  } else if (forward) {
+    moveServo(servoLeft);
+    alertMessage = "Forward direction emergency signal detected";
+    Serial.println("⬆ FORWARD EMERGENCY SIGNAL");
+  } else if (backward) {
+    moveServo(servoRight);
+    alertMessage = "Backward direction emergency signal detected";
+    Serial.println("⬇ BACKWARD EMERGENCY SIGNAL");
+  }
+  
+  lastMessage = alertMessage;
+  triggerEmergencyCall(alertMessage);
+}
+
+// ----------------- Web Interface -----------------
+String generateHTML() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>SOS Detector Control</title>";
+  html += "<style>body{font-family:Arial;background:#1a1a2e;color:#fff;text-align:center;padding:20px;margin:0}";
+  html += ".container{max-width:600px;margin:0 auto;background:#16213e;padding:30px;border-radius:10px;box-shadow:0 4px 20px rgba(0,0,0,0.3)}";
+  html += ".status{font-size:1.2em;margin:20px 0;padding:15px;border-radius:5px;background:#0f3460}";
+  html += ".btn{display:inline-block;padding:12px 25px;margin:10px;background:#e94560;color:white;text-decoration:none;border-radius:5px;transition:all 0.3s}";
+  html += ".btn:hover{background:#c73650;transform:translateY(-2px)}";
+  html += ".signal-indicator{display:inline-block;width:20px;height:20px;border-radius:50%;margin:0 10px}";
+  html += ".active{background:#00ff41;box-shadow:0 0 10px #00ff41}";
+  html += ".inactive{background:#333}</style></head><body>";
+  
+  html += "<div class='container'>";
+  html += "<h1>🛡 SAFE STEPS SOS DETECTOR</h1>";
+  html += "<div class='status'><strong>Status:</strong> " + lastMessage + "</div>";
+  html += "<div class='status'><strong>System:</strong> " + signalStatus + "</div>";
+  
+  html += "<div style='margin:20px 0'>";
+  html += "<span>Forward Signal:</span><span class='signal-indicator " + String(forwardSignal ? "active" : "inactive") + "'></span>";
+  html += "<span>Backward Signal:</span><span class='signal-indicator " + String(backwardSignal ? "active" : "inactive") + "'></span>";
+  html += "</div>";
+  
+  html += "<div><a href='/manual' class='btn'>🔍 Manual Check</a>";
+  html += "<a href='/test' class='btn'>📞 Test Call</a>";
+  html += "<a href='/reset' class='btn'>🔄 Reset System</a></div>";
+  
+  html += "<div style='margin-top:30px;font-size:0.9em;opacity:0.8'>";
+  html += "WiFi Status: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected");
+  html += "</div></body></html>";
+  
+  return html;
+}
+
+void setupWebServer() {
+  server.on("/", []() {
+    server.send(200, "text/html", generateHTML());
+  });
+  
+  server.on("/manual", []() {
+    Serial.println("🔍 Manual detection initiated");
+    bool manualForward = digitalRead(forwardPin);
+    bool manualBackward = digitalRead(backwardPin);
+    
+    if (manualForward || manualBackward) {
+      processEmergencySignal(manualForward, manualBackward);
+      lastMessage = "Manual detection: Emergency signal found!";
+    } else {
+      lastMessage = "Manual check completed - No emergency signals";
+      signalStatus = "Standby";
+    }
+    
+    server.sendHeader("Location", "/");
+    server.send(302);
+  });
+  
+  server.on("/test", []() {
+    triggerEmergencyCall("System test call from SOS detector");
+    lastMessage = "Test call initiated";
+    server.send(200, "text/plain", "Test call sent!");
+  });
+  
+  server.on("/reset", []() {
+    sosDetected = false;
+    forwardSignal = false;
+    backwardSignal = false;
+    signalStatus = "Standby";
+    lastMessage = "System reset - Ready for detection";
+    moveServo(servoCenter);
+    Serial.println("🔄 System manually reset");
+    
+    server.sendHeader("Location", "/");
+    server.send(302);
+  });
+  
+  server.on("/status", []() {
+    String json = "{";
+    json += "\"message\":\"" + lastMessage + "\",";
+    json += "\"status\":\"" + signalStatus + "\",";
+    json += "\"sos\":" + String(sosDetected ? "true" : "false") + ",";
+    json += "\"forward\":" + String(forwardSignal ? "true" : "false") + ",";
+    json += "\"backward\":" + String(backwardSignal ? "true" : "false") + ",";
+    json += "\"wifi\":\"" + String(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected") + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+}
+
+// ----------------- Main Setup -----------------
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n🚀 === SAFE STEPS SOS DETECTOR v2.0 ===");
+  
+  // Configure pins
+  pinMode(forwardPin, INPUT_PULLDOWN);
+  pinMode(backwardPin, INPUT_PULLDOWN);
+  Serial.println("📍 Pins configured: D19 (Forward), D21 (Backward)");
+  
+  // Initialize servo
+  myServo.attach(servoPin);
+  moveServo(servoCenter);
+  Serial.println("🎯 Servo initialized at center position");
+  
+  // Start WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifi_ssid, wifi_password);
+  
+  Serial.print("📶 Connecting to WiFi");
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 15000) {
+    Serial.print(".");
+    delay(500);
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ WiFi Connected!");
+    Serial.println("🌐 IP Address: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n⚠ WiFi connection failed - starting AP mode");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ap_ssid, ap_password);
+    Serial.println("📡 AP Mode: " + WiFi.softAPIP().toString());
+  }
+  
+  // Configure secure client
+  secureClient.setInsecure();
+  
+  // Start web server
+  setupWebServer();
+  server.begin();
+  Serial.println("🖥 Web server started");
+  
+  // Initial state
+  lastForwardState = digitalRead(forwardPin);
+  lastBackwardState = digitalRead(backwardPin);
+  lastForwardChange = millis();
+  lastBackwardChange = millis();
+  
+  systemReady = true;
+  Serial.println("✅ System fully initialized and ready!");
+  Serial.println("🔗 Access web interface at: http://" + WiFi.localIP().toString());
+}
+
+// ----------------- Main Loop -----------------
+void loop() {
+  server.handleClient();
+  
+  if (!systemReady) return;
+  
+  unsigned long now = millis();
+  
+  // Read digital pins (D19, D21)
+  bool currentForward = digitalRead(forwardPin);
+  bool currentBackward = digitalRead(backwardPin);
+  
+  // Debounce forward signal
+  if (currentForward != lastForwardState) {
+    lastForwardChange = now;
+  }
+  if ((now - lastForwardChange) > debounceDelay) {
+    if (forwardSignal != currentForward) {
+      forwardSignal = currentForward;
+      if (forwardSignal) Serial.println("⬆ Forward signal detected");
+    }
+  }
+  lastForwardState = currentForward;
+  
+  // Debounce backward signal
+  if (currentBackward != lastBackwardState) {
+    lastBackwardChange = now;
+  }
+  if ((now - lastBackwardChange) > debounceDelay) {
+    if (backwardSignal != currentBackward) {
+      backwardSignal = currentBackward;
+      if (backwardSignal) Serial.println("⬇ Backward signal detected");
+    }
+  }
+  lastBackwardState = currentBackward;
+  
+  // Process emergency detection (with cooldown)
+  if (!sosDetected && (now - lastDetectionTime > detectionCooldown)) {
+    if (forwardSignal || backwardSignal) {
+      processEmergencySignal(forwardSignal, backwardSignal);
+    }
+  }
+  
+  // Auto-reset system after emergency
+  if (sosDetected && (now - lastDetectionTime > resetDelay)) {
+    sosDetected = false;
+    forwardSignal = false;
+    backwardSignal = false;
+    signalStatus = "Standby";
+    lastMessage = "System auto-reset - Ready for detection";
+    moveServo(servoCenter);
+    Serial.println("🔄 System auto-reset to standby");
+  }
+  
+  // Status debug (every 10 seconds)
+  static unsigned long lastDebug = 0;
+  if (now - lastDebug > 10000) {
+    Serial.printf("📊 Status - Forward: %s, Backward: %s, SOS: %s\n", 
+                  forwardSignal ? "HIGH" : "LOW",
+                  backwardSignal ? "HIGH" : "LOW",
+                  sosDetected ? "ACTIVE" : "STANDBY");
+    lastDebug = now;
+  }
+  
+  // Keep WiFi alive
+  if (WiFi.status() != WL_CONNECTED) {
+    static unsigned long lastReconnect = 0;
+    if (now - lastReconnect > 30000) {
+      Serial.println("📶 Attempting WiFi reconnection...");
+      WiFi.reconnect();
+      lastReconnect = now;
+    }
+  }
+}
